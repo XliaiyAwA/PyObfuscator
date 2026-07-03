@@ -15,31 +15,31 @@
 
 ```bash
 # 基本用法（默认标准档位）
-python obfuscator_ultimate_fixed_v2.py input.py
+python pyobfuscator.py input.py
 
 # 指定输出文件
-python obfuscator_ultimate_fixed_v2.py input.py -o output.py
+python pyobfuscator.py input.py -o output.py
 
 # 使用轻量档位
-python obfuscator_ultimate_fixed_v2.py input.py -l light
+python pyobfuscator.py input.py -l light
 
 # 使用强化档位
-python obfuscator_ultimate_fixed_v2.py input.py -l heavy
+python pyobfuscator.py input.py -l heavy
 
 # 在标准档位基础上开启同形字命名和动态属性
-python obfuscator_ultimate_fixed_v2.py input.py -O "+homoglyph-names,+dynamic-attrs"
+python pyobfuscator.py input.py -O "+homoglyph-names,+dynamic-attrs"
 
 # 在强化档位基础上关闭控制流扁平化
-python obfuscator_ultimate_fixed_v2.py input.py -l heavy -O "-control-flatten"
+python pyobfuscator.py input.py -l heavy -O "-control-flatten"
 
 # 保留文档字符串
-python obfuscator_ultimate_fixed_v2.py input.py --keep-doc
+python pyobfuscator.py input.py --keep-doc
 
 # 指定随机种子（可重现混淆结果）
-python obfuscator_ultimate_fixed_v2.py input.py --seed 42
+python pyobfuscator.py input.py --seed 42
 
-# 静默模式
-python obfuscator_ultimate_fixed_v2.py input.py -q
+# 静默模式，只输出一行结果摘要
+python pyobfuscator.py input.py -q
 ```
 
 ---
@@ -81,22 +81,22 @@ dynamic-attrs, scramble-annotations, fstring-obfuscate
 
 ```bash
 # 在标准档位基础上，额外开启同形字命名和动态属性
-python obfuscator.py input.py -O "+homoglyph-names,+dynamic-attrs"
+python pyobfuscator.py input.py -O "+homoglyph-names,+dynamic-attrs"
 
 # 在强化档位基础上，关闭死代码注入和控制流扁平化
-python obfuscator.py input.py -l heavy -O "-dead-code,-control-flatten"
+python pyobfuscator.py input.py -l heavy -O "-dead-code,-control-flatten"
 
 # 在轻量档位基础上，开启数字混淆和浮点混淆
-python obfuscator.py input.py -l light -O "+number-obfuscate,+float-obfuscate"
+python pyobfuscator.py input.py -l light -O "+number-obfuscate,+float-obfuscate"
 
 # 在标准档位基础上，关闭垃圾代码（标准预设默认开启，取反后关闭）
-python obfuscator.py input.py -O "junk-code"
+python pyobfuscator.py input.py -O "junk-code"
 
 # 同时开启多个选项
-python obfuscator.py input.py -l light -O "+number-obfuscate,+float-obfuscate,+bool-obscure,+opaque-predicates"
+python pyobfuscator.py input.py -l light -O "+number-obfuscate,+float-obfuscate,+bool-obscure,+opaque-predicates"
 
 # 在强化档位基础上关闭导入隐藏，同时开启同形字命名
-python obfuscator.py input.py -l heavy -O "-import-hide,+homoglyph-names"
+python pyobfuscator.py input.py -l heavy -O "-import-hide,+homoglyph-names"
 ```
 
 > **提示**：`-O` 的修改是在档位预设之上叠加的。先加载预设的所有默认值，再按 `-O` 中的指令逐一调整。因此可以用轻量档位 + 手动开启选项的方式，自定义出任意组合。
