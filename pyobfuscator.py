@@ -3,6 +3,7 @@
 from __future__ import annotations
 import ast
 import base64
+import codecs
 import hashlib
 import math
 import random
@@ -50,7 +51,7 @@ def _confusing_name(rng: random.Random, homoglyphs: bool = False) -> str:
 
 
 # ============================================================
-# 惰性Opaque Predicate生成器
+# 惰性不透明谓词生成器
 # ============================================================
 
 def _make_opaque_true(rng: random.Random) -> str:
@@ -195,7 +196,7 @@ LEVEL_PRESETS: Dict[str, Dict] = {
         "opaque-prob": 0.0,
         "dead-code": False,
         "control-flatten": False,
-        "import-hide": True
+        "import-hide": True,
         "homoglyph-names": False,
         "bool-obscure": False,
         "expr-wrap": False,
@@ -271,6 +272,14 @@ LEVEL_PRESETS: Dict[str, Dict] = {
 
 
 # ============================================================
+# 自定义异常
+# ============================================================
+
+class ObfuscationError(Exception):
+    """混淆过程中发生错误时抛出。"""
+
+
+# ============================================================
 # 文档字符串移除器
 # ============================================================
 
@@ -303,10 +312,13 @@ class DocstringRemover(ast.NodeTransformer):
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             if isinstance(body[0].value.value, str):
                 del body[0]
+        # 移除文档字符串后，函数/类/模块体不能为空，否则生成无效代码
+        if not body:
+            body.append(ast.Pass())
 
 
 # ============================================================
-# 类型注解剥离器（新增）
+# 类型注解剥离器
 # ============================================================
 
 class AnnotationScrambler(ast.NodeTransformer):
@@ -338,11 +350,11 @@ class AnnotationScrambler(ast.NodeTransformer):
 
 
 # ============================================================
-# 主混淆器（终极版）
+# 主混淆器
 # ============================================================
 
 class Obfuscator(ast.NodeTransformer):
-    """终极版Python代码混淆器 — 支持Python 3.11~3.13语法，极致混淆"""
+    
 
     def __init__(
         self,
@@ -411,8 +423,16 @@ class Obfuscator(ast.NodeTransformer):
         self._user_funcs: Set[str] = set()
         self._user_methods: Set[str] = set()
         self._user_class_attrs: Set[str] = set()
+        self._kwargs_funcs: Set[str] = set()      # 接受 **kwargs 的函数
+        self._kwargs_methods: Set[str] = set()    # 接受 **kwargs 的类方法
+        self._defined_classes: Set[str] = set()   # 当前模块中定义的类名
+        self._internal_class_names: Set[str] = set()  # 非外部继承类的类名（原始名和重命名后名）
+        self._external_class_names: Set[str] = set()  # 继承外部类的类名（原始名和重命名后名）
+        self._external_method_params: Set[str] = set()  # 继承外部类的方法参数名
         self._rename_kwargs_stack: List[bool] = []
         self._in_fstring_flag: int = 0
+        self._argparse_attrs: Set[str] = set()
+        self._argparse_namespace_vars: Set[str] = set()
 
         self._builtin_attrs_blacklist: Set[str] = {
             'append', 'extend', 'insert', 'remove', 'pop', 'clear', 'index',
@@ -493,8 +513,14 @@ class Obfuscator(ast.NodeTransformer):
     def _is_special_method(self, name: str) -> bool:
         return name.startswith("__") and name.endswith("__")
 
+    @staticmethod
+    def _is_ast_visitor(name: str) -> bool:
+        """ast.NodeTransformer 通过 visit / visit_<Node> 方法名反射调用访问器，
+        重命名这些方法会导致访问器失效，因此需要保留。"""
+        return name == "visit" or name.startswith("visit_")
+
     def _is_reserved(self, name: str) -> bool:
-        return name in self.reserved or self._is_special_method(name)
+        return name in self.reserved or self._is_special_method(name) or self._is_ast_visitor(name)
 
     def _generate_name(self, prefix: str = "") -> str:
         max_attempts = 1000
@@ -552,6 +578,13 @@ class Obfuscator(ast.NodeTransformer):
             tree = ast.fix_missing_locations(tree)
 
         obfuscated = ast.unparse(tree)
+
+        # 编译校验，提前发现混淆器引入的语法错误
+        try:
+            compile(obfuscated, "<obfuscated>", "exec")
+        except SyntaxError as exc:
+            raise ObfuscationError(f"混淆后代码存在语法错误（请确认运行环境 Python 版本不低于目标代码）: {exc}") from exc
+
         return obfuscated
 
     # ---------- 定义收集 ----------
@@ -559,27 +592,44 @@ class Obfuscator(ast.NodeTransformer):
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self._user_funcs.add(node.name)
+                if node.args.kwarg is not None:
+                    self._kwargs_funcs.add(node.name)
                 if self.func_rename and not self._is_special_method(node.name):
                     if not self._is_reserved(node.name) and node.name not in self._builtin_attrs_blacklist:
                         new_name = self._generate_name("f")
                         self.name_mapping[node.name] = new_name
                         self._user_funcs.add(new_name)
+                        if node.args.kwarg is not None:
+                            self._kwargs_funcs.add(new_name)
             elif isinstance(node, ast.ClassDef):
+                self._defined_classes.add(node.name)
                 if self.class_rename and not self._is_reserved(node.name):
                     new_name = self._generate_name("C")
                     self.name_mapping[node.name] = new_name
                     self._user_funcs.add(new_name)
+                # Enum 成员名会被 Enum 元类用于 .name 属性，不能重命名
+                is_enum = any(
+                    isinstance(base, ast.Name) and base.id in ("Enum", "IntEnum", "Flag", "IntFlag")
+                    for base in node.bases
+                )
                 for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        if not self._is_special_method(item.name):
-                            self._user_methods.add(item.name)
-                    elif isinstance(item, ast.Assign):
+                    if isinstance(item, ast.Assign):
                         for tgt in item.targets:
-                            if isinstance(tgt, ast.Name):
-                                self._user_class_attrs.add(tgt.id)
+                            if isinstance(tgt, ast.Name) and not self._is_reserved(tgt.id):
+                                if is_enum:
+                                    self.reserved.add(tgt.id)
+                                else:
+                                    self._user_class_attrs.add(tgt.id)
                     elif isinstance(item, ast.AnnAssign):
-                        if isinstance(item.target, ast.Name):
-                            self._user_class_attrs.add(item.target.id)
+                        if isinstance(item.target, ast.Name) and not self._is_reserved(item.target.id):
+                            if is_enum:
+                                self.reserved.add(item.target.id)
+                            else:
+                                self._user_class_attrs.add(item.target.id)
+                    elif isinstance(item, ast.ClassDef):
+                        # 嵌套类作为类属性，其访问点（如 self.Inner）需要统一重命名
+                        if not self._is_reserved(item.name) and not is_enum:
+                            self._user_class_attrs.add(item.name)
             elif isinstance(node, ast.Global):
                 for name in node.names:
                     if self.var_rename and not self._is_reserved(name):
@@ -590,6 +640,57 @@ class Obfuscator(ast.NodeTransformer):
                     if self.var_rename and not self._is_reserved(name):
                         if name not in self.name_mapping:
                             self.name_mapping[name] = self._generate_name("v")
+            elif isinstance(node, ast.Call):
+                self._collect_argparse_dest(node)
+            elif isinstance(node, ast.Assign):
+                self._collect_argparse_namespace_var(node)
+
+    # ---------- argparse dest 收集 ----------
+    def _collect_argparse_dest(self, node: ast.Call) -> None:
+        """收集 argparse add_argument 的 dest 属性名，避免重命名后 Namespace 访问失败。"""
+        if not isinstance(node.func, ast.Attribute):
+            return
+        if node.func.attr != "add_argument":
+            return
+
+        # 显式 dest=xxx
+        for kw in node.keywords:
+            if kw.arg == "dest" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                self._argparse_attrs.add(kw.value.value)
+                return
+
+        # 从位置参数推导 dest
+        option_strings: List[str] = []
+        positional: Optional[str] = None
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                if arg.value.startswith("-"):
+                    option_strings.append(arg.value)
+                elif positional is None:
+                    positional = arg.value
+
+        if option_strings:
+            # argparse 使用最长选项字符串推导 dest
+            longest = max(option_strings, key=len)
+            dest = longest.lstrip("-").replace("-", "_")
+            if dest:
+                self._argparse_attrs.add(dest)
+        elif positional:
+            self._argparse_attrs.add(positional)
+
+    def _collect_argparse_namespace_var(self, node: ast.Assign) -> None:
+        """识别 'args = parser.parse_args()' 这类赋值，记录 Namespace 变量名。"""
+        if not node.value or not isinstance(node.value, ast.Call):
+            return
+        call = node.value
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "parse_args":
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self._argparse_namespace_vars.add(tgt.id)
+                elif isinstance(tgt, (ast.Tuple, ast.List)):
+                    for elt in tgt.elts:
+                        if isinstance(elt, ast.Name):
+                            self._argparse_namespace_vars.add(elt.id)
 
     # ---------- 辅助 ----------
     def _mark_docstring(self, node: ast.AST) -> None:
@@ -603,11 +704,58 @@ class Obfuscator(ast.NodeTransformer):
         return self._in_fstring_flag > 0
 
     def _in_class_body(self) -> bool:
-        """Check if we're directly inside a class body (not inside a function/method)."""
+        """检查是否直接位于类体内部（而非位于函数/方法内部）。"""
         for parent in reversed(self.parent_stack):
             if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 return False
             if isinstance(parent, ast.ClassDef):
+                return True
+        return False
+
+    def _is_method_definition(self) -> bool:
+        """检查当前访问的节点是否是一个直接定义在类体中的方法。
+
+        与 _in_class_body 不同，此方法会跳过栈顶的函数定义节点本身，
+        因为 visit 方法在调用访问器前已经将当前函数节点压入 parent_stack。
+        """
+        skipped_current = False
+        for parent in reversed(self.parent_stack):
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not skipped_current:
+                    skipped_current = True
+                    continue
+                return False
+            if isinstance(parent, ast.ClassDef):
+                return True
+        return False
+
+    def _get_enclosing_class(self) -> Optional[ast.ClassDef]:
+        """返回当前节点所在的最近类定义节点（如果存在）。"""
+        for parent in reversed(self.parent_stack):
+            if isinstance(parent, ast.ClassDef):
+                return parent
+        return None
+
+    def _in_external_method(self) -> bool:
+        """检查当前节点是否位于继承外部类的方法定义内部。"""
+        if not self._is_method_definition():
+            return False
+        enclosing = self._get_enclosing_class()
+        return enclosing is not None and enclosing.name not in self._internal_class_names
+
+    def _class_inherits_external(self, node: ast.ClassDef) -> bool:
+        """检查类是否继承自当前模块之外定义的类。
+
+        如果子类重写的方法名被重命名，而基类方法名未被重命名，
+        对基类方法的调用（包括 super().method）会失败。因此这类类
+        的方法名需要保留原样。
+        """
+        for base in node.bases:
+            if isinstance(base, ast.Name):
+                if base.id not in self._defined_classes:
+                    return True
+            else:
+                # Attribute/Call/Subscript 等基类均视为外部类
                 return True
         return False
 
@@ -623,10 +771,15 @@ class Obfuscator(ast.NodeTransformer):
                 return True
         return False
 
-    def _in_match_pattern(self) -> bool:
+    def _in_match_pattern(self, node: Optional[ast.AST] = None) -> bool:
         for parent in reversed(self.parent_stack):
             if isinstance(parent, (ast.MatchValue, ast.MatchSingleton, ast.MatchAs)):
                 return True
+            if isinstance(parent, ast.MatchMapping):
+                # MatchMapping 的 key 必须是字面量/属性引用，不能混淆
+                if node is not None and node in parent.keys:
+                    return True
+                return False
         return False
 
     def _is_call_target(self) -> bool:
@@ -668,7 +821,7 @@ class Obfuscator(ast.NodeTransformer):
             self.stats["junk_blocks"] += 1
             insert_pos += len(junk_stmts)
     # ==========================================================
-    # Module / Function / Class visitors
+    # 模块 / 函数 / 类访问器
     # ==========================================================
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
@@ -680,14 +833,35 @@ class Obfuscator(ast.NodeTransformer):
         self._mark_docstring(node)
         original_name = node.name
         is_recursive = self._function_is_recursive(node, original_name)
-        if self.func_rename and not self._is_special_method(node.name):
+        inherits_external = False
+        if self._is_method_definition():
+            enclosing = self._get_enclosing_class()
+            inherits_external = enclosing is not None and enclosing.name not in self._internal_class_names
+        if self.func_rename and not self._is_special_method(node.name) and not inherits_external:
             if node.name not in self._builtin_attrs_blacklist:
                 if node.name in self.name_mapping:
+                    node.name = self.name_mapping[node.name]
+                elif self._is_method_definition() and node.name in self._user_methods:
+                    # 类方法定义与调用统一使用 m 前缀，保持 Attribute 访问一致
+                    self.name_mapping[node.name] = self._generate_name("m")
                     node.name = self.name_mapping[node.name]
                 elif not self._is_reserved(node.name):
                     node.name = self._mapped_name(node.name, "f")
                 self.stats["funcs_renamed"] += 1
+        # 继承外部类的方法参数名及其引用均需保留，避免调用处关键字参数不匹配。
+        old_external_params = self._external_method_params
+        self._external_method_params = set()
+        if inherits_external:
+            params: Set[str] = set()
+            for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                params.add(arg.arg)
+            if node.args.vararg is not None:
+                params.add(node.args.vararg.arg)
+            if node.args.kwarg is not None:
+                params.add(node.args.kwarg.arg)
+            self._external_method_params = params
         self.generic_visit(node)
+        self._external_method_params = old_external_params
         if self.control_flatten and node.body and not is_recursive:
             node.body = self._flatten_body(node.body)
         self._insert_junk_into_body(node.body)
@@ -699,14 +873,34 @@ class Obfuscator(ast.NodeTransformer):
         self._mark_docstring(node)
         original_name = node.name
         is_recursive = self._function_is_recursive(node, original_name)
-        if self.func_rename and not self._is_special_method(node.name):
+        inherits_external = False
+        if self._is_method_definition():
+            enclosing = self._get_enclosing_class()
+            inherits_external = enclosing is not None and enclosing.name not in self._internal_class_names
+        if self.func_rename and not self._is_special_method(node.name) and not inherits_external:
             if node.name not in self._builtin_attrs_blacklist:
                 if node.name in self.name_mapping:
+                    node.name = self.name_mapping[node.name]
+                elif self._is_method_definition() and node.name in self._user_methods:
+                    self.name_mapping[node.name] = self._generate_name("m")
                     node.name = self.name_mapping[node.name]
                 elif not self._is_reserved(node.name):
                     node.name = self._mapped_name(node.name, "a")
                 self.stats["funcs_renamed"] += 1
+        # 继承外部类的方法参数名及其引用均需保留，避免调用处关键字参数不匹配。
+        old_external_params = self._external_method_params
+        self._external_method_params = set()
+        if inherits_external:
+            params: Set[str] = set()
+            for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                params.add(arg.arg)
+            if node.args.vararg is not None:
+                params.add(node.args.vararg.arg)
+            if node.args.kwarg is not None:
+                params.add(node.args.kwarg.arg)
+            self._external_method_params = params
         self.generic_visit(node)
+        self._external_method_params = old_external_params
         if self.control_flatten and node.body and not is_recursive:
             node.body = self._flatten_body(node.body)
         self._insert_junk_into_body(node.body)
@@ -716,14 +910,37 @@ class Obfuscator(ast.NodeTransformer):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
         self._mark_docstring(node)
+        original_name = node.name
+        inherits_external = self._class_inherits_external(node)
         if self.class_rename and not self._is_reserved(node.name):
             if node.name in self.name_mapping:
                 node.name = self.name_mapping[node.name]
             else:
                 node.name = self._mapped_name(node.name, "C")
             self.stats["classes_renamed"] += 1
-        self.generic_visit(node)
-        return node
+        # 缓存内部/外部类名称，供 visit_FunctionDef 和 visit_Call 判断。
+        # 必须在 generic_visit 前完成判断，因为基类引用随后会被 visit_Name 改写。
+        if not inherits_external:
+            self._internal_class_names.add(original_name)
+            if original_name != node.name:
+                self._internal_class_names.add(node.name)
+        else:
+            self._external_class_names.add(original_name)
+            if original_name != node.name:
+                self._external_class_names.add(node.name)
+        # 同时保留原始类名和重命名后的类名，以便子类在混淆前后都能识别为内部类。
+        if original_name != node.name:
+            self._defined_classes.add(node.name)
+        # 对于继承自当前模块外部类的子类，其方法可能重写基类方法，
+        # 重命名会导致对基类方法的调用失败，因此需要保留方法名原样。
+        if not inherits_external:
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not self._is_special_method(item.name) and not self._is_reserved(item.name):
+                        self._user_methods.add(item.name)
+                    if item.args.kwarg is not None:
+                        self._kwargs_methods.add(item.name)
+        return self.generic_visit(node)
 
     def visit_Global(self, node: ast.Global) -> ast.Global:
         if self.var_rename:
@@ -763,8 +980,7 @@ class Obfuscator(ast.NodeTransformer):
         if node.name and self.var_rename and not self._is_reserved(node.name):
             node.name = self._mapped_name(node.name, "v")
             self.stats["vars_renamed"] += 1
-        else:
-            self.generic_visit(node)
+        self.generic_visit(node)
         return node
 
     def visit_MatchValue(self, node: ast.MatchValue) -> ast.MatchValue:
@@ -809,7 +1025,7 @@ class Obfuscator(ast.NodeTransformer):
         return node
 
     # ==========================================================
-    # Python 3.11+ 异常组支持（新增）
+    # Python 3.11+ 异常组支持
     # ==========================================================
 
     def visit_ExceptStar(self, node: ast.ExceptStar) -> ast.ExceptStar:
@@ -821,7 +1037,7 @@ class Obfuscator(ast.NodeTransformer):
         return node
 
     # ==========================================================
-    # Python 3.12+ TypeAlias / TypeVar / ParamSpec / TypeVarTuple
+    # Python 3.12+ 类型相关节点支持（TypeAlias / TypeVar / ParamSpec / TypeVarTuple）
     # ==========================================================
     # 使用 hasattr 条件检测确保 Python 3.11 兼容
 
@@ -874,7 +1090,10 @@ class Obfuscator(ast.NodeTransformer):
         in_class = self._in_class_body()
 
         if isinstance(node.ctx, (ast.Store, ast.Load, ast.Del)):
-            if node.id in self.import_aliases:
+            if node.id in self._external_method_params:
+                # 继承外部类的方法参数名保持原样，避免调用处关键字参数不匹配。
+                pass
+            elif node.id in self.import_aliases:
                 pass
             elif node.id in self.name_mapping:
                 node.id = self.name_mapping[node.id]
@@ -885,8 +1104,8 @@ class Obfuscator(ast.NodeTransformer):
                     node.id = self.name_mapping[node.id]
                     renamed = True
             elif self.var_rename and not self._is_reserved(node.id):
-                # Skip renaming if it's a known user function that's in the blacklist
-                # (the function definition won't be renamed either, so keep consistent)
+                # 若该名称是已知的用户函数且位于黑名单中，则跳过重命名
+                # （函数定义本身也不会被重命名，因此需保持一致）
                 if node.id in self._user_funcs and node.id in self._builtin_attrs_blacklist:
                     pass
                 else:
@@ -942,23 +1161,38 @@ class Obfuscator(ast.NodeTransformer):
         return node
 
     def visit_arg(self, node: ast.arg) -> ast.arg:
-        if self.var_rename and not self._is_reserved(node.arg):
+        # 继承外部类的方法参数名若被重命名，而调用处关键字参数名未重命名，
+        # 会导致关键字调用失败，因此保持原样。
+        if self.var_rename and not self._is_reserved(node.arg) and not self._in_external_method():
             node.arg = self._mapped_name(node.arg, "a")
             self.stats["vars_renamed"] += 1
         self.generic_visit(node)
         return node
 
     def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        # 先保存 value 的原始变量名，因为 generic_visit 会将其重命名
+        original_value_id = node.value.id if isinstance(node.value, ast.Name) else None
         self.generic_visit(node)
 
+        # argparse Namespace 的属性名由 add_argument 的 dest 决定。
+        # 当属性访问对象是已识别的 Namespace 变量时，避免重命名该属性。
+        if (
+            node.attr in self._argparse_attrs
+            and original_value_id is not None
+            and original_value_id in self._argparse_namespace_vars
+        ):
+            return node
+
+        # name_mapping 只应作用于 Name 节点，避免变量名污染任意属性访问
         if not self._is_reserved(node.attr) and node.attr not in self._builtin_attrs_blacklist:
-            if node.attr in self.name_mapping:
-                node.attr = self.name_mapping[node.attr]
-            elif node.attr in self._user_methods:
-                self.name_mapping[node.attr] = self._generate_name("m")
+            if node.attr in self._user_methods:
+                # 类方法定义已统一使用 m 前缀，调用处同步
+                if node.attr not in self.name_mapping:
+                    self.name_mapping[node.attr] = self._generate_name("m")
                 node.attr = self.name_mapping[node.attr]
             elif node.attr in self._user_class_attrs:
-                self.name_mapping[node.attr] = self._generate_name("c")
+                if node.attr not in self.name_mapping:
+                    self.name_mapping[node.attr] = self._generate_name("c")
                 node.attr = self.name_mapping[node.attr]
 
         if self.dynamic_attrs and isinstance(node.ctx, ast.Load):
@@ -989,16 +1223,23 @@ class Obfuscator(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.Call:
         should_rename_kwargs = False
         has_starstar_kwargs = any(kw.arg is None for kw in node.keywords)
+        callee_has_kwargs = False
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
-            if func_name in self._user_funcs or func_name in self.name_mapping:
-                should_rename_kwargs = not has_starstar_kwargs
+            callee_has_kwargs = func_name in self._kwargs_funcs
+            if func_name in self._external_class_names:
+                # 继承外部类的类，其 __init__ 参数名被保留，关键字参数名也需保留
+                should_rename_kwargs = False
+            elif func_name in self._user_funcs or func_name in self.name_mapping:
+                # 只要目标函数接受 **kwargs，普通关键字参数的键名也必须保持原样
+                should_rename_kwargs = not has_starstar_kwargs and not callee_has_kwargs
         elif isinstance(node.func, ast.Attribute):
             method_name = node.func.attr
+            callee_has_kwargs = method_name in self._kwargs_methods
             if method_name in self._user_methods and method_name not in self._builtin_attrs_blacklist:
-                should_rename_kwargs = not has_starstar_kwargs
+                should_rename_kwargs = not has_starstar_kwargs and not callee_has_kwargs
 
-        # Pre-process **kwargs dicts: rename literal keys to match renamed parameters
+        # 预处理 **kwargs 字典：将字面量键重命名为与已重命名参数一致
         if has_starstar_kwargs and (isinstance(node.func, ast.Name) and
             (node.func.id in self._user_funcs or node.func.id in self.name_mapping)):
             for kw in node.keywords:
@@ -1058,7 +1299,7 @@ class Obfuscator(ast.NodeTransformer):
         return node
 
     # ==========================================================
-    # f-string 混淆（新增）
+    # f-string 混淆
     # ==========================================================
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
@@ -1078,7 +1319,7 @@ class Obfuscator(ast.NodeTransformer):
             if self._rng.random() < 0.5:
                 return node
 
-            # Check if any expression parts exist
+            # 检查是否存在表达式部分
             has_expression = any(
                 not isinstance(v, ast.Constant) or not isinstance(v.value, str)
                 for v in node.values
@@ -1094,22 +1335,29 @@ class Obfuscator(ast.NodeTransformer):
 
             self.stats["fstrings_obfuscated"] += 1
 
-            # Build template with positional placeholders {0}, {1}, ...
+            # 使用位置占位符 {0}、{1}、... 构建模板
             template_parts = []
             format_args = []
-            for v in node.values:
+            for i, v in enumerate(node.values):
                 if isinstance(v, ast.Constant) and isinstance(v.value, str):
-                    template_parts.append(v.value)
+                    # f"{x=}" 会生成 Constant("x=") + FormattedValue(x)，
+                    # 转成 .format() 会改变输出格式（x=1 -> x= 1），直接跳过
+                    if v.value.endswith("=") and i + 1 < len(node.values):
+                        next_v = node.values[i + 1]
+                        if isinstance(next_v, ast.FormattedValue):
+                            return node
+                    # AST 已经把 {{ / }} 解码为 { / }，转成 .format() 前需重新转义
+                    template_parts.append(v.value.replace("{", "{{").replace("}", "}}"))
                 else:
                     template_parts.append(f"{{{len(format_args)}}}")
                     format_args.append(v)
 
             template_str = "".join(template_parts)
 
-            # Encode the template string (must not interfere with {0} {1} placeholder syntax)
+            # 对模板字符串进行编码（不得干扰 {0} {1} 占位符语法）
             if self.string_encode and template_str:
                 try:
-                    # Use a simple encoding for the template to avoid issues with {} in format strings
+                    # 对模板使用简单编码，以避免格式字符串中 {} 引发问题
                     key = self._rng.randint(32, 127)
                     data = template_str.encode("utf-8")
                     xored = bytes(b ^ key for b in data)
@@ -1165,7 +1413,8 @@ class Obfuscator(ast.NodeTransformer):
                     return True
                 if self._body_contains_early_exit(stmt.orelse):
                     return True
-            if isinstance(stmt, (ast.With, ast.AsyncWith, ast.Try)):
+            if isinstance(stmt, (ast.With, ast.AsyncWith, ast.Try)) or \
+               (hasattr(ast, 'TryStar') and isinstance(stmt, ast.TryStar)):
                 if hasattr(stmt, 'body') and self._body_contains_early_exit(stmt.body):
                     return True
                 if hasattr(stmt, 'finalbody') and self._body_contains_early_exit(stmt.finalbody):
@@ -1188,6 +1437,8 @@ class Obfuscator(ast.NodeTransformer):
         for stmt in body:
             if isinstance(stmt, (ast.Try, ast.With, ast.AsyncWith,
                                  ast.For, ast.AsyncFor, ast.While)):
+                return body
+            if hasattr(ast, 'TryStar') and isinstance(stmt, ast.TryStar):
                 return body
             if hasattr(ast, 'Match') and isinstance(stmt, ast.Match):
                 return body
@@ -1258,6 +1509,10 @@ class Obfuscator(ast.NodeTransformer):
                 if self._is_future_import(stmt):
                     new_body.append(stmt)
                     continue
+                # 相对导入保留原语句，避免 __import__('', ...) 或 level 丢失导致运行时错误
+                if getattr(stmt, "level", 0) > 0:
+                    new_body.append(stmt)
+                    continue
                 module = stmt.module or ""
                 for alias in stmt.names:
                     if alias.name == "*":
@@ -1288,18 +1543,26 @@ class Obfuscator(ast.NodeTransformer):
                 keywords=[],
             )
         elif asname is not None:
-            # import X.Y as Z: Z 指向子模块 X.Y
-            first_sub = parts[1]
-            call = ast.Call(
-                func=ast.Name(id="__import__", ctx=ast.Load()),
-                args=[ast.Constant(value=module_name)],
-                keywords=[
-                    ast.keyword(
-                        arg="fromlist",
-                        value=ast.List(elts=[ast.Constant(value=first_sub)], ctx=ast.Load()),
-                    ),
-                ],
-            )
+            if len(parts) == 1:
+                # import X as Z: Z 指向顶层模块 X
+                call = ast.Call(
+                    func=ast.Name(id="__import__", ctx=ast.Load()),
+                    args=[ast.Constant(value=module_name)],
+                    keywords=[],
+                )
+            else:
+                # import X.Y as Z: Z 指向子模块 X.Y
+                first_sub = parts[1]
+                call = ast.Call(
+                    func=ast.Name(id="__import__", ctx=ast.Load()),
+                    args=[ast.Constant(value=module_name)],
+                    keywords=[
+                        ast.keyword(
+                            arg="fromlist",
+                            value=ast.List(elts=[ast.Constant(value=first_sub)], ctx=ast.Load()),
+                        ),
+                    ],
+                )
         else:
             # import X.Y: 顶层名 X 指向顶层包
             call = ast.Call(
@@ -1315,46 +1578,31 @@ class Obfuscator(ast.NodeTransformer):
     def _make_hidden_import_from(
         self, module: str, name: str, asname: str
     ) -> ast.Assign:
-        full_name = f"{module}.{name}" if module else name
-        first_sub = name
-        # 先尝试作为子模块导入（带 fromlist），失败时退化为 getattr
-        try:
-            __import__(full_name, fromlist=[first_sub])
-            is_submodule = True
-        except (ModuleNotFoundError, ImportError):
-            is_submodule = False
+        """将 'from module import name as asname' 转换为隐藏导入赋值。
 
-        if is_submodule:
-            value: ast.expr = ast.Call(
-                func=ast.Name(id="__import__", ctx=ast.Load()),
-                args=[ast.Constant(value=full_name)],
-                keywords=[
-                    ast.keyword(
-                        arg="fromlist",
-                        value=ast.List(elts=[ast.Constant(value=first_sub)], ctx=ast.Load()),
-                    ),
-                ],
-            )
-        else:
-            value = ast.Call(
-                func=ast.Name(id="getattr", ctx=ast.Load()),
-                args=[
-                    ast.Call(
-                        func=ast.Name(id="__import__", ctx=ast.Load()),
-                        args=[ast.Constant(value=module)],
-                        keywords=[
-                            ast.keyword(
-                                arg="fromlist",
-                                value=ast.List(
-                                    elts=[ast.Constant(value=name)], ctx=ast.Load()
-                                ),
+        统一使用 getattr(__import__(module or name, fromlist=[name]), name)，
+        避免在混淆阶段真实执行导入（可能触发副作用或依赖缺失）。
+        """
+        import_module = module if module else name
+        value: ast.expr = ast.Call(
+            func=ast.Name(id="getattr", ctx=ast.Load()),
+            args=[
+                ast.Call(
+                    func=ast.Name(id="__import__", ctx=ast.Load()),
+                    args=[ast.Constant(value=import_module)],
+                    keywords=[
+                        ast.keyword(
+                            arg="fromlist",
+                            value=ast.List(
+                                elts=[ast.Constant(value=name)], ctx=ast.Load()
                             ),
-                        ],
-                    ),
-                    ast.Constant(value=name),
-                ],
-                keywords=[],
-            )
+                        ),
+                    ],
+                ),
+                ast.Constant(value=name),
+            ],
+            keywords=[],
+        )
         return ast.Assign(
             targets=[ast.Name(id=asname, ctx=ast.Store())],
             value=value,
@@ -1560,56 +1808,90 @@ class Obfuscator(ast.NodeTransformer):
         return encoders.get(method, self._encode_xor_base64)
 
     def _apply_multi_round_encoding(self, s: str) -> ast.expr:
-        """多轮编码：链式组合多个编码方法（新增）"""
+        """多轮编码：链式组合多个可嵌套解码方法。"""
         if not self.string_multi_round or len(s) < 5:
             return self._choose_string_encoder(s)(s)
 
-        num_rounds = min(self._rng.randint(2, 3), len(self.string_methods))
-        available = list(self.string_methods)
-
-        chain = []
-        for _ in range(num_rounds):
-            if not available:
-                break
-            method = self._rng.choice(available)
-            if method == "split-encode" and len(s) < 3:
-                continue
-            if method == "shuffle" and len(s) < 3:
-                continue
-            chain.append(method)
-            available.remove(method)
-
-        if len(chain) < 2:
+        chainable = {"xor-base64", "hex-xor", "zlib-base64", "zlib-xor",
+                     "rot13-base64", "reverse"}
+        available = [m for m in self.string_methods if m in chainable]
+        if len(available) < 2:
             return self._choose_string_encoder(s)(s)
 
-        # Chain: encode strings sequentially
-        current_s = s
-        encoded_parts = []
-        for method in chain:
-            encoder_map = {
-                "xor-base64": lambda ss: (f"bytes(b^k for b in __import__('base64').b64decode({repr(base64.b64encode(bytes(b^int(list(repr(ss))[0]) for b in ss.encode())))}))", "fake"),
-                "zlib-base64": lambda ss: ("zlib", "fake"),
-            }
-            pass
+        self._rng.shuffle(available)
+        num_rounds = self._rng.randint(2, min(3, len(available)))
+        chain = available[:num_rounds]
 
-        # Build a chain expression: method_n( ... method_2(method_1(data)) ... )
         try:
-            import copy
-            expr = self._choose_string_encoder(s)(s)
-            # Re-wrap with additional encoding layers
-            current_expr_code = ast.unparse(expr) if s else repr(s)
-            for method in chain:
-                encoder = self._choose_string_encoder(s)
-                current_expr_code = ast.unparse(encoder(s))
-                break
-            # Simpler approach: just use multi-layer if available
-            if "multi-layer" in self.string_methods:
-                self.stats["multi_round_strings"] += 1
-                return self._encode_multi_layer(s)
+            self.stats["multi_round_strings"] += 1
+            return self._build_chain_expr(s, chain)
         except Exception:
-            pass
-        self.stats["multi_round_strings"] += 1
-        return self._choose_string_encoder(s)(s)
+            return self._choose_string_encoder(s)(s)
+
+    def _encode_round(self, s: str, method: str) -> Tuple[str, str]:
+        """返回 (加密数据字符串, 解码模板)，模板中用 {data} 占位输入。"""
+        if method == "xor-base64":
+            key = self._rng.randint(32, 127)
+            xored = bytes(b ^ key for b in s.encode("utf-8"))
+            data = base64.b64encode(xored).decode("ascii")
+            return data, (
+                "bytes(b^%d for b in __import__('base64').b64decode({data})).decode()"
+                % key
+            )
+        if method == "hex-xor":
+            key = self._rng.randint(32, 127)
+            xored = bytes(b ^ key for b in s.encode("utf-8"))
+            data = xored.hex()
+            return data, (
+                "bytes(b^%d for b in bytes.fromhex({data})).decode()"
+                % key
+            )
+        if method == "zlib-base64":
+            data = base64.b64encode(zlib.compress(s.encode("utf-8"))).decode("ascii")
+            return data, (
+                "__import__('zlib').decompress(__import__('base64').b64decode({data})).decode()"
+            )
+        if method == "zlib-xor":
+            key = self._rng.randint(32, 127)
+            compressed = zlib.compress(s.encode("utf-8"))
+            xored = bytes(b ^ key for b in compressed)
+            data = base64.b64encode(xored).decode("ascii")
+            return data, (
+                "__import__('zlib').decompress(bytes(b^%d for b in __import__('base64').b64decode({data}))).decode()"
+                % key
+            )
+        if method == "rot13-base64":
+            key = self._rng.randint(32, 127)
+            xored = bytes(b ^ key for b in codecs.encode(s, "rot_13").encode("utf-8"))
+            data = base64.b64encode(xored).decode("ascii")
+            return data, (
+                "__import__('codecs').decode(bytes(b^%d for b in __import__('base64').b64decode({data})).decode(), 'rot_13')"
+                % key
+            )
+        if method == "reverse":
+            key = self._rng.randint(32, 127)
+            xored = bytes(b ^ key for b in s[::-1].encode("utf-8"))
+            data = base64.b64encode(xored).decode("ascii")
+            return data, (
+                "bytes(b^%d for b in __import__('base64').b64decode({data})).decode()[::-1]"
+                % key
+            )
+        raise ValueError(f"unsupported chain method: {method}")
+
+    def _build_chain_expr(self, s: str, chain: List[str]) -> ast.expr:
+        """把 chain 中各方法串起来：decoder_0(decoder_1(...(data_n)...))。"""
+        data = s
+        templates = []
+        for method in chain:
+            data, template = self._encode_round(data, method)
+            templates.append(template)
+
+        code = "{data}"
+        for template in reversed(templates):
+            code = template.replace("{data}", code)
+
+        code = code.replace("{data}", repr(data))
+        return self._parse_expr(code)
 
     # ==========================================================
     # 数字混淆（10种方法）
@@ -1863,16 +2145,17 @@ class Obfuscator(ast.NodeTransformer):
         if method == 0:
             return self._parse_expr("0.0")
         elif method == 1:
-            return self._parse_expr(f"float({self._rng.randint(1, 100)} - {self._rng.randint(1, 100)})")
+            n = self._rng.randint(1, 100)
+            return self._parse_expr(f"float({n} - {n})")
         else:
             return self._parse_expr("float(0)")
 
     def _float_add_sub(self, val: float) -> ast.AST:
-        # Use float.fromhex to preserve exact bit pattern
+        # 使用 float.fromhex 保留精确的位模式
         return self._float_hex(val)
 
     def _float_mul_div(self, val: float) -> ast.AST:
-        # Use struct to preserve exact bit pattern
+        # 使用 struct 保留精确的位模式
         return self._float_struct(val)
 
     def _float_hex(self, val: float) -> ast.AST:
@@ -1998,7 +2281,7 @@ class Obfuscator(ast.NodeTransformer):
         return self._parse_expr(self._rng.choice(patterns))
 
     # ==========================================================
-    # visit_Constant（终极版）
+    # visit_Constant
     # ==========================================================
 
     def visit_Constant(self, node: ast.Constant) -> Union[ast.Constant, ast.AST]:
@@ -2010,7 +2293,7 @@ class Obfuscator(ast.NodeTransformer):
             return node
 
         if self.bool_obscure and isinstance(node.value, bool):
-            if not self._in_subscript() and not self._in_match_pattern():
+            if not self._in_subscript() and not self._in_match_pattern(node):
                 return self._obfuscate_bool(node.value)
 
         if self.bytes_obfuscate and isinstance(node.value, bytes) and node.value:
@@ -2023,7 +2306,10 @@ class Obfuscator(ast.NodeTransformer):
                 pass
 
         if self.string_encode and isinstance(node.value, str) and node.value:
-            if not self._in_match_pattern():
+            if not self._in_match_pattern(node):
+                # argparse dest 名需要与属性访问保持一致，不能编码为解密表达式
+                if node.value in self._argparse_attrs:
+                    return node
                 try:
                     if self.string_multi_round and len(node.value) >= 5:
                         new_node = self._apply_multi_round_encoding(node.value)
@@ -2038,7 +2324,7 @@ class Obfuscator(ast.NodeTransformer):
 
         if self.number_obfuscate and isinstance(node.value, int) and not isinstance(node.value, bool):
             val = node.value
-            if abs(val) < 100000 and not self._in_match_pattern():
+            if abs(val) < 100000 and not self._in_match_pattern(node):
                 method = self._rng.randint(0, 9)
                 try:
                     new_node = self._obfuscate_int(val, method)
@@ -2049,7 +2335,7 @@ class Obfuscator(ast.NodeTransformer):
                     pass
 
         if self.float_obfuscate and isinstance(node.value, float):
-            if not self._in_match_pattern():
+            if not self._in_match_pattern(node):
                 try:
                     new_node = self._obfuscate_float(node.value)
                     ast.fix_missing_locations(new_node)
@@ -2061,12 +2347,12 @@ class Obfuscator(ast.NodeTransformer):
         return node
 
     # ==========================================================
-    # 容器常量混淆 visitor
+    # 容器常量混淆访问器
     # ==========================================================
 
     def visit_List(self, node: ast.List) -> ast.AST:
         self.generic_visit(node)
-        if self.container_obfuscate and self._rng.random() < 0.4:
+        if self.container_obfuscate and isinstance(node.ctx, ast.Load) and self._rng.random() < 0.4:
             try:
                 new_node = self._obfuscate_list(node)
                 ast.fix_missing_locations(new_node)
@@ -2078,7 +2364,7 @@ class Obfuscator(ast.NodeTransformer):
 
     def visit_Tuple(self, node: ast.Tuple) -> ast.AST:
         self.generic_visit(node)
-        if self.container_obfuscate and self._rng.random() < 0.3:
+        if self.container_obfuscate and isinstance(node.ctx, ast.Load) and self._rng.random() < 0.3:
             try:
                 new_node = self._obfuscate_tuple(node)
                 ast.fix_missing_locations(new_node)
@@ -2090,6 +2376,7 @@ class Obfuscator(ast.NodeTransformer):
 
     def visit_Set(self, node: ast.Set) -> ast.AST:
         self.generic_visit(node)
+        # ast.Set 没有 ctx 属性，永远是 Load 上下文
         if self.container_obfuscate and self._rng.random() < 0.5:
             try:
                 new_node = self._obfuscate_set(node)
@@ -2102,6 +2389,7 @@ class Obfuscator(ast.NodeTransformer):
 
     def visit_Dict(self, node: ast.Dict) -> ast.AST:
         self.generic_visit(node)
+        # ast.Dict 没有 ctx 属性，永远是 Load 上下文
         if self.container_obfuscate and self._rng.random() < 0.3:
             try:
                 new_node = self._obfuscate_dict(node)
@@ -2120,7 +2408,7 @@ class Obfuscator(ast.NodeTransformer):
         self.generic_visit(node)
         if self.binop_wrap and self._rng.random() < 0.2:
             if not self._in_annotation() and not self._in_fstring():
-                # Check if this is a string operation (str * int, str + str, etc.)
+                # 检查这是否为字符串运算（str * int、str + str 等）
                 is_str_op = False
                 for child in ast.walk(node):
                     if isinstance(child, ast.Constant) and isinstance(child.value, str):
@@ -2129,44 +2417,24 @@ class Obfuscator(ast.NodeTransformer):
                 if is_str_op:
                     return node
 
-                wrap_type = self._rng.randint(0, 2)
+                # 仅使用 IfExp 包装：opaque_true 恒成立，返回 body 即原表达式，
+                # 对所有类型安全；+0/*1 会改变 bytes/list/set 等非数值运算的语义。
                 try:
-                    if wrap_type == 0:
-                        opaque = self._make_opaque_true_expr()
-                        new_node = ast.IfExp(
-                            test=opaque,
-                            body=node,
-                            orelse=node,
-                        )
-                        ast.fix_missing_locations(new_node)
-                        self.stats["binops_wrapped"] += 1
-                        return new_node
-                    elif wrap_type == 1:
-                        if isinstance(node, (ast.BinOp, ast.Constant, ast.Name)):
-                            new_node = ast.BinOp(
-                                left=node,
-                                op=ast.Add(),
-                                right=ast.Constant(value=0),
-                            )
-                            ast.fix_missing_locations(new_node)
-                            self.stats["binops_wrapped"] += 1
-                            return new_node
-                    else:
-                        if isinstance(node, (ast.BinOp, ast.Constant, ast.Name)):
-                            new_node = ast.BinOp(
-                                left=node,
-                                op=ast.Mult(),
-                                right=ast.Constant(value=1),
-                            )
-                            ast.fix_missing_locations(new_node)
-                            self.stats["binops_wrapped"] += 1
-                            return new_node
+                    opaque = self._make_opaque_true_expr()
+                    new_node = ast.IfExp(
+                        test=opaque,
+                        body=node,
+                        orelse=node,
+                    )
+                    ast.fix_missing_locations(new_node)
+                    self.stats["binops_wrapped"] += 1
+                    return new_node
                 except Exception:
                     pass
         return node
 
     # ==========================================================
-    # Opaque Predicate
+    # 不透明谓词
     # ==========================================================
 
     def _make_opaque_true_expr(self) -> ast.expr:
@@ -2196,7 +2464,7 @@ class Obfuscator(ast.NodeTransformer):
             if self._rng.random() < 0.5:
                 node.test = ast.BoolOp(op=ast.And(), values=[opaque, node.test])
             else:
-                node.test = ast.BoolOp(op=ast.Or(), values=[ast.UnaryOp(op=ast.Not(), operand=self._make_opaque_false_expr()), node.test])
+                node.test = ast.BoolOp(op=ast.Or(), values=[ast.UnaryOp(op=ast.Not(), operand=opaque), node.test])
         return node
 
     def visit_For(self, node: ast.For) -> ast.For:
@@ -2479,7 +2747,7 @@ class Obfuscator(ast.NodeTransformer):
             ]
 
     # ==========================================================
-    # 垃圾代码生成（20种模式，修复 WithPass bug）
+    # 垃圾代码生成（20种模式，修复 WithPass 缺陷）
     # ==========================================================
 
     def _generate_junk_code(self) -> List[ast.stmt]:
@@ -2775,7 +3043,7 @@ class Obfuscator(ast.NodeTransformer):
         ]
 
     def _junk_with_pass(self) -> List[ast.stmt]:
-        """修复：使用跨平台的 os.devnull 作为 context manager"""
+        """修复：使用跨平台的 os.devnull 作为上下文管理器"""
         jv = self._generate_name("j")
         return [
             ast.With(
